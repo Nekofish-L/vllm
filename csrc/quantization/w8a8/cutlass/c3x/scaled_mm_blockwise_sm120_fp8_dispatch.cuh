@@ -174,12 +174,37 @@ void cutlass_gemm_blockwise_sm120_fp8_dispatch(torch::Tensor& out,
                                                torch::Tensor const& b,
                                                torch::Tensor const& a_scales,
                                                torch::Tensor const& b_scales) {
-  // TODO: better heuristics
-  cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<
-      OutType, 1, 128, 128, Shape<_128, _128, _128>,
-      Shape<_1, _1, _1>, cutlass::epilogue::collective::EpilogueScheduleAuto,
-      cutlass::gemm::collective::KernelScheduleAuto>>(
-      out, a, b, a_scales, b_scales);
+  int32_t m = a.size(0), n = b.size(1), sms = 0;
+  cudaError_t err =
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                             a.get_device());
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaDeviceGetAttribute failed: ", cudaGetErrorString(err));
+
+  // Scale granularity in N and K must match the quantization block size (128).
+  constexpr int TILE_N = 128;
+  constexpr int TILE_K = 128;
+
+  // Use a smaller tile size (64-M with Pingpong schedule) when the problem is
+  // small enough that 64-M tiles can fully utilize all SMs. This is typical in
+  // the decode phase (small batch sizes). For larger problems (prefill phase),
+  // use 128-M tiles with the default schedule to maximize throughput.
+  //
+  // Note: SM120 Cooperative kernel requires Tile M >= 128. For smaller M tiles
+  // we use the Pingpong schedule which supports M=64.
+  if (cuda_utils::ceil_div(n, TILE_N) * cuda_utils::ceil_div(m, 64) <= sms) {
+    cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<
+        OutType, 1, TILE_N, TILE_K, Shape<_64, _128, _128>,
+        Shape<_1, _1, _1>, cutlass::epilogue::collective::EpilogueScheduleAuto,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpong>>(
+        out, a, b, a_scales, b_scales);
+  } else {
+    cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<
+        OutType, 1, TILE_N, TILE_K, Shape<_128, _128, _128>,
+        Shape<_1, _1, _1>, cutlass::epilogue::collective::EpilogueScheduleAuto,
+        cutlass::gemm::collective::KernelScheduleAuto>>(
+        out, a, b, a_scales, b_scales);
+  }
 }
 
 }  // namespace vllm
