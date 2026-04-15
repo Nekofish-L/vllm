@@ -1163,6 +1163,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 
   # SM120 FP8 block-scale MOE GEMM kernel - requires SM120 and CUDA 12.8+
+  # CUDA 12.8 is needed for SM120's blockscaled MMA instruction support
+  # (SM120_16x8x32_TN_VS), TMA descriptors, and UE8M0 scale format.
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(SM120_MOE_ARCHS "12.0f" "${CUDA_ARCHS}")
   else()

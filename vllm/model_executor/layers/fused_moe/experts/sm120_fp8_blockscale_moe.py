@@ -77,9 +77,7 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
     with FP8 E4M3 data and UE8M0 (E8M0) block scales.
     """
 
-    def __init__(
-        self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig
-    ):
+    def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
         assert quant_config.quant_dtype == torch.float8_e4m3fn
         assert quant_config.block_shape is not None
@@ -171,8 +169,15 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
 
         # Scale layout: [sf_K, scale_leading_dim]
         sf_K = (K + 511) // 512
-        # Padded M for scale alignment (matches compute_padded_offset)
-        scale_ld = (M_total + num_experts * 3) // 4 * 4
+        # Padded M for scale alignment: the MOE scale layout packs 4 UE8M0
+        # values per int32, so each expert's scale offset must be 4-aligned.
+        # compute_padded_offset(offset, idx) = (offset + idx * 3) // 4 * 4
+        # The worst case adds (num_experts - 1) * 3 padding elements, hence
+        # scale_ld >= M_total + (num_experts - 1) * 3 rounded up to 4.
+        _SCALE_ALIGN = 4  # Must match C++ compute_padded_offset alignment
+        scale_ld = (
+            (M_total + num_experts * (_SCALE_ALIGN - 1)) // _SCALE_ALIGN * _SCALE_ALIGN
+        )
         a_scales = torch.zeros(
             (sf_K, scale_ld),
             dtype=torch.int32,
@@ -233,9 +238,7 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
 
         # Step 1: Permute tokens by expert assignment
         # Use deepgemm permute utilities for contiguous expert grouping
-        a1q_perm = _resize_cache(
-            workspace13.view(dtype=a1q.dtype), (M_total, K)
-        )
+        a1q_perm = _resize_cache(workspace13.view(dtype=a1q.dtype), (M_total, K))
         a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
@@ -253,9 +256,7 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
         )
         if expert_tokens_meta is not None:
             for i in range(local_num_experts):
-                expert_num_tokens[i] = (
-                    expert_tokens_meta.expert_num_tokens[i].item()
-                )
+                expert_num_tokens[i] = expert_tokens_meta.expert_num_tokens[i].item()
         else:
             # Count from expert_ids
             for i in range(local_num_experts):

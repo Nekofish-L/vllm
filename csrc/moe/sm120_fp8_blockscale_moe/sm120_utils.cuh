@@ -26,10 +26,14 @@ using namespace cutlass;
 namespace sm120_blockscaled_gemm {
 
 // Compute padded offset for MOE-aware scale layout alignment.
-// Ensures per-expert scale storage is aligned to 4-element boundaries.
+// Ensures per-expert scale storage is aligned to 4-element boundaries,
+// because 4 UE8M0 values are packed into each int32.
+// IMPORTANT: The alignment constant must match the Python-side
+// _SCALE_ALIGN in sm120_fp8_blockscale_moe.py.
 template <typename T_offset, typename T_index>
 CUTE_HOST_DEVICE static T_offset compute_padded_offset(T_offset offset,
                                                        T_index problem_idx) {
+  // 4 UE8M0 values per int32 → 4-element alignment
   constexpr T_offset alignment = 4;
   return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
 }

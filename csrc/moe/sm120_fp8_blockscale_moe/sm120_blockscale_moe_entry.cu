@@ -136,8 +136,13 @@ void sm120_fp8_blockscale_quant_a(torch::Tensor& fp8_output,
   dim3 grid(k_blocks, y_blocks, 1);
   dim3 block(ThreadsPerBlock, 1, 1);
 
-  // Shared memory for token_offset array
+  // Shared memory for token_offset array.
+  // Typical MOE models have at most ~256 experts, so this is well within
+  // the 48KB default shared memory limit (256+1)*8 = ~2KB.
   int smem_size = (num_experts + 1) * sizeof(int64_t);
+  TORCH_CHECK(smem_size <= 48 * 1024,
+              "sm120_fp8_blockscale_quant_a: too many experts (",
+              num_experts, "), shared memory exceeds 48KB limit");
 
   // Scale leading dimension (padded M)
   int64_t m_padded =

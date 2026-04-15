@@ -32,8 +32,8 @@ __device__ __forceinline__ float reciprocal_approximate_ftz(float a) {
 // Online BF16-to-FP8 quantization kernel for MOE activations.
 //
 // Quantizes BF16 activation tokens to FP8 E4M3 format with UE8M0 (E8M0)
-// block scales. Each warp handles one token, processing 512 elements
-// (4 blocks of 128 elements) per K-block.
+// block scales. Each warp handles one token, processing kElemsPerWarp
+// elements (4 blocks of kBlockSize=128 elements) per K-block.
 //
 // Scale output is packed as int32 (4 x UE8M0 per int32) in a MOE-aware
 // layout using compute_padded_offset for per-expert alignment.
@@ -92,8 +92,17 @@ __global__ void scale_1x128_kernel_sm120(
     const int64_t local_token_idx =
         token_idx - smem_token_offset[expert_idx];
 
+    // Named constants for block quantization geometry
+    // kBlockSize: quantization block size (128 elements per scale)
+    // kBlocksPerWarp: blocks processed per warp (4 blocks × 128 = 512 elems)
+    // kElemsPerThread: elements loaded per thread (32 threads × 16 = 512)
+    constexpr int kBlockSize = 128;
+    constexpr int kBlocksPerWarp = 4;
+    constexpr int kElemsPerWarp = kBlockSize * kBlocksPerWarp;  // 512
+    constexpr int kElemsPerThread = kElemsPerWarp / 32;  // 16
+
     // Check if this thread's data is within k bounds
-    int const k_offset = (k_block_idx * 512 + lane_id * 16);
+    int const k_offset = (k_block_idx * kElemsPerWarp + lane_id * kElemsPerThread);
 
     // 1. Load 16 BF16 elements per thread (512 per warp)
     auto const cur_input_ptr = reinterpret_cast<double4 const*>(

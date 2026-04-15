@@ -126,7 +126,7 @@ def backend_to_kernel_cls(
         return [FlashInferExperts]
 
     elif backend == Fp8MoeBackend.SM120_BLOCKSCALE:
-        from vllm.model_executor.layers.fused_moe.experts.sm120_fp8_blockscale_moe import (
+        from vllm.model_executor.layers.fused_moe.experts.sm120_fp8_blockscale_moe import (  # noqa: E501
             SM120BlockscaleMoEExperts,
         )
 
