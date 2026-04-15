@@ -37,7 +37,10 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.fused_moe.utils import (
+    _resize_cache,
+    count_expert_num_tokens,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -242,26 +245,20 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
             aq_out=a1q_perm,
         )
 
-        # Build token_offset from expert_ids
-        expert_num_tokens = torch.zeros(
-            local_num_experts,
-            dtype=torch.long,
-            device=a1q.device,
-        )
+        # Build token_offset from topk_ids
         if expert_tokens_meta is not None:
-            for i in range(local_num_experts):
-                expert_num_tokens[i] = expert_tokens_meta.expert_num_tokens[i].item()
+            expert_num_tokens = expert_tokens_meta.expert_num_tokens
         else:
-            expert_num_tokens = torch.bincount(
-                expert_ids, minlength=local_num_experts
-            ).to(torch.long)
+            expert_num_tokens = count_expert_num_tokens(
+                topk_ids, local_num_experts, expert_map
+            )
 
         token_offset = torch.zeros(
             local_num_experts + 1,
             dtype=torch.long,
             device=a1q.device,
         )
-        torch.cumsum(expert_num_tokens, dim=0, out=token_offset[1:])
+        torch.cumsum(expert_num_tokens.to(torch.long), dim=0, out=token_offset[1:])
         actual_M_total = int(token_offset[-1].item())
 
         # Step 2: Quantize A (BF16→FP8+FP32) for GEMM1
