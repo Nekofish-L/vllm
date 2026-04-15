@@ -3,8 +3,12 @@
 //
 // Entry point for SM120 FP8 block-scale MOE GEMM kernels.
 // Provides C++ functions callable from PyTorch custom ops for:
-//   1. sm120_fp8_blockscale_moe_gemm: Grouped GEMM with FP8 blockscale
+//   1. sm120_fp8_blockscale_moe_gemm: Grouped GEMM with FP8 blockwise scaling
 //   2. sm120_fp8_blockscale_quant_a: Online BF16→FP8 quantization
+//
+// The GEMM uses CUTLASS v4.4.2 CollectiveBuilder with SM120's blockwise
+// scaling support (Sm120BlockwiseScaleConfig) and GroupProblemShape for
+// per-expert grouped GEMM.
 //
 // These functions are registered as torch ops in csrc/moe/torch_bindings.cpp.
 
@@ -14,36 +18,85 @@
 #include <torch/all.h>
 
 #include "core/registration.h"
-#include "sm120_fp8_moe_gemm.cuh"
 #include "sm120_fp8_quant.cuh"
-#include "sm120_utils.cuh"
 
-namespace sm120_blockscaled_gemm {
+#include "cutlass/cutlass.h"
+#include "cutlass/numeric_types.h"
+#include "cute/tensor.hpp"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/epilogue/dispatch_policy.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass_extensions/common.hpp"
 
-// Default tile configuration: TileM=32, TileN=128, Stages=4
-using DefaultBuilder = SM120BlockScaledBuilder<32, 128, 4>;
-using DefaultMoeKernel = SM120BlockScaledMoeKernel<DefaultBuilder>;
+using namespace cute;
 
-// Kernel launch wrapper for MOE GEMM
-__global__ void __launch_bounds__(DefaultMoeKernel::MaxThreadsPerBlock,
-                                  DefaultMoeKernel::MinBlocksPerMultiprocessor)
-    sm120_moe_gemm_kernel(DefaultMoeKernel::Params params) {
-  extern __shared__ char smem_buf[];
-  DefaultMoeKernel kernel;
-  kernel(params, smem_buf);
+// ============================================================================
+// Helper kernel: set up per-expert pointer arrays for grouped GEMM
+// ============================================================================
+template <typename ElementAB, typename ElementD, typename ElementSF,
+          typename LayoutSFA, typename LayoutSFB, typename ScaleConfig>
+__global__ void setup_group_gemm_pointers(
+    ElementAB** a_ptrs, ElementAB** b_ptrs, ElementD** out_ptrs,
+    ElementSF** a_sf_ptrs, ElementSF** b_sf_ptrs,
+    LayoutSFA* layout_sfa_out, LayoutSFB* layout_sfb_out,
+    int64_t* a_strides, int64_t* b_strides, int64_t* c_strides,
+    int32_t* problem_sizes_out,
+    // Base pointers
+    ElementAB* a_base, ElementAB* b_base, ElementD* out_base,
+    ElementSF* a_sf_base, ElementSF* b_sf_base,
+    // Layout info
+    const int64_t* token_offset, int num_experts,
+    int N, int K) {
+  int expert_id = threadIdx.x;
+  if (expert_id >= num_experts) return;
+
+  int64_t start = token_offset[expert_id];
+  int64_t end = token_offset[expert_id + 1];
+  int m = static_cast<int>(end - start);
+
+  // A: [M_total, K] row-major, per-expert slice starts at row 'start'
+  a_ptrs[expert_id] = a_base + start * K;
+
+  // B: [num_experts, N, K] — each expert has its own [N, K] weight
+  b_ptrs[expert_id] = b_base + expert_id * static_cast<int64_t>(N) * K;
+
+  // Output: [M_total, N] row-major
+  out_ptrs[expert_id] = out_base + start * N;
+
+  // A scale factors: [M_total, ceil(K/128)] column-major
+  int scale_k = (K + 127) / 128;
+  a_sf_ptrs[expert_id] = a_sf_base + start;
+
+  // B scale factors: [num_experts, N, ceil(K/128)] column-major per expert
+  b_sf_ptrs[expert_id] = b_sf_base + expert_id * N * scale_k;
+
+  // Strides
+  a_strides[expert_id] = K;      // row-major stride for A
+  b_strides[expert_id] = K;      // column-major stride for B (N,K)
+  c_strides[expert_id] = N;      // row-major stride for output
+
+  // Problem sizes: [M, N, K]
+  problem_sizes_out[expert_id * 3 + 0] = m;
+  problem_sizes_out[expert_id * 3 + 1] = N;
+  problem_sizes_out[expert_id * 3 + 2] = K;
+
+  // Scale factor layouts (CUTLASS deduced)
+  layout_sfa_out[expert_id] =
+      ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, N, K, 1));
+  layout_sfb_out[expert_id] =
+      ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, N, K, 1));
 }
 
-}  // namespace sm120_blockscaled_gemm
+// ============================================================================
+// SM120 FP8 Blockwise Grouped GEMM using CUTLASS CollectiveBuilder
+// ============================================================================
 
-// C++ interface: SM120 FP8 block-scale MOE GEMM
-//
-// Arguments:
-//   output    : [M_total, N]       BF16 output tensor
-//   a_fp8     : [M_total, K]       FP8 E4M3 quantized activations
-//   b_fp8     : [num_experts, N, K] FP8 E4M3 expert weights
-//   a_scales  : [sf_K, pad(M_total)] int32 packed E8M0 scales for A
-//   b_scales  : [num_experts, pad(N), sf_K] int32 packed E8M0 scales for B
-//   token_offset : [num_experts + 1]  int64 cumulative token offsets
 void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
                                     torch::Tensor const& a_fp8,
                                     torch::Tensor const& b_fp8,
@@ -56,6 +109,8 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
               "B must be FP8 E4M3");
   TORCH_CHECK(token_offset.scalar_type() == at::ScalarType::Long,
               "token_offset must be int64");
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16,
+              "Output must be BFloat16");
 
   int M_total = a_fp8.size(0);
   int K = a_fp8.size(1);
@@ -65,52 +120,191 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
   TORCH_CHECK(b_fp8.size(2) == K, "K dimension mismatch between A and B");
   TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
 
-  using namespace sm120_blockscaled_gemm;
-  using KT = DefaultBuilder;
-  using Kernel = DefaultMoeKernel;
+  if (M_total == 0) return;
 
-  auto problem_shape = cute::make_shape(M_total, N, K, num_experts);
+  // --- CUTLASS types ---
+  using ProblemShape =
+      cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
+  using ElementAB = cutlass::float_e4m3_t;
+  using ElementD = cutlass::bfloat16_t;
+  using ElementAccumulator = float;
+  using ElementBlockScale = float;
 
-  // Build arguments
-  typename Kernel::Arguments args{
-      reinterpret_cast<KT::ElementA*>(a_fp8.data_ptr()),
-      cute::make_stride(int64_t(K), cute::Int<1>{}, int64_t(M_total * K)),
-      reinterpret_cast<KT::ElementB*>(b_fp8.data_ptr()),
-      cute::make_stride(int64_t(K), cute::Int<1>{}, int64_t(N * K)),
-      reinterpret_cast<KT::ElementSFLoad*>(a_scales.data_ptr()),
-      typename KT::StrideSFA{},
-      reinterpret_cast<KT::ElementSFLoad*>(b_scales.data_ptr()),
-      typename KT::StrideSFB{},
-      reinterpret_cast<KT::ElementD*>(output.data_ptr()),
-      cute::make_stride(int64_t(N), cute::Int<1>{}, int64_t(M_total * N)),
-      static_cast<int64_t*>(token_offset.data_ptr()),
-  };
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = LayoutC;
 
-  auto params = Kernel::to_underlying_arguments(problem_shape, args);
-  auto grid = Kernel::get_grid_shape(params);
-  auto block = Kernel::get_block_shape();
+  static constexpr int AlignmentA =
+      128 / cutlass::sizeof_bits<ElementAB>::value;
+  static constexpr int AlignmentB =
+      128 / cutlass::sizeof_bits<ElementAB>::value;
+  static constexpr int AlignmentC =
+      128 / cutlass::sizeof_bits<ElementD>::value;
+  static constexpr int AlignmentD =
+      128 / cutlass::sizeof_bits<ElementD>::value;
 
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+
+  // Scale config: blockwise scaling with granularity (1, 128, 128) matching
+  // quantization block size
+  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
+      1, 128, 128,
+      cute::UMMA::Major::MN, cute::UMMA::Major::K>;
+
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+  // Tile and schedule configuration
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+
+  using KernelSchedule =
+      cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule =
+      cutlass::epilogue::collective::EpilogueScheduleAuto;
+
+  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
+      ElementD, ElementAccumulator, ElementD, ElementAccumulator>;
+
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, MmaTileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementAccumulator,
+          ElementD, LayoutC*, AlignmentC,
+          ElementD, LayoutD*, AlignmentD,
+          EpilogueSchedule, FusionOperation>::CollectiveOp;
+
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag, OperatorClass,
+          ElementAB, cute::tuple<LayoutA*, LayoutSFA>, AlignmentA,
+          ElementAB, cute::tuple<LayoutB*, LayoutSFB>, AlignmentB,
+          ElementAccumulator, MmaTileShape, ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<
+              static_cast<int>(
+                  sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+  using UnderlyingProblemShape = ProblemShape::UnderlyingProblemShape;
+
+  auto device = a_fp8.device();
   auto stream = at::cuda::getCurrentCUDAStream(a_fp8.get_device());
 
-  // Set dynamic shared memory size
-  int smem_size = Kernel::kSmemSize;
-  if (smem_size > 48 * 1024) {
-    cudaFuncSetAttribute(sm120_moe_gemm_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_size);
-  }
+  // Allocate per-expert pointer arrays
+  auto opts_long =
+      torch::TensorOptions().device(device).dtype(torch::kLong);
+  auto opts_int =
+      torch::TensorOptions().device(device).dtype(torch::kInt);
+  auto opts_byte =
+      torch::TensorOptions().device(device).dtype(torch::kByte);
 
-  sm120_moe_gemm_kernel<<<grid, block, smem_size, stream>>>(params);
+  auto a_ptrs = torch::empty({num_experts}, opts_long);
+  auto b_ptrs = torch::empty({num_experts}, opts_long);
+  auto out_ptrs = torch::empty({num_experts}, opts_long);
+  auto a_sf_ptrs = torch::empty({num_experts}, opts_long);
+  auto b_sf_ptrs = torch::empty({num_experts}, opts_long);
+  auto layout_sfa = torch::empty(
+      {num_experts, static_cast<int>(sizeof(LayoutSFA) / sizeof(int64_t))},
+      opts_long);
+  auto layout_sfb = torch::empty(
+      {num_experts, static_cast<int>(sizeof(LayoutSFB) / sizeof(int64_t))},
+      opts_long);
+  auto a_strides_t = torch::empty({num_experts}, opts_long);
+  auto b_strides_t = torch::empty({num_experts}, opts_long);
+  auto c_strides_t = torch::empty({num_experts}, opts_long);
+  auto problem_sizes = torch::empty({num_experts * 3}, opts_int);
+
+  // Launch pointer setup kernel
+  setup_group_gemm_pointers<ElementAB, ElementD, ElementBlockScale,
+                            LayoutSFA, LayoutSFB, ScaleConfig>
+      <<<1, num_experts, 0, stream>>>(
+          reinterpret_cast<ElementAB**>(a_ptrs.data_ptr()),
+          reinterpret_cast<ElementAB**>(b_ptrs.data_ptr()),
+          reinterpret_cast<ElementD**>(out_ptrs.data_ptr()),
+          reinterpret_cast<ElementBlockScale**>(a_sf_ptrs.data_ptr()),
+          reinterpret_cast<ElementBlockScale**>(b_sf_ptrs.data_ptr()),
+          reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),
+          reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr()),
+          static_cast<int64_t*>(a_strides_t.data_ptr()),
+          static_cast<int64_t*>(b_strides_t.data_ptr()),
+          static_cast<int64_t*>(c_strides_t.data_ptr()),
+          static_cast<int32_t*>(problem_sizes.data_ptr()),
+          // Base pointers
+          reinterpret_cast<ElementAB*>(a_fp8.data_ptr()),
+          reinterpret_cast<ElementAB*>(b_fp8.data_ptr()),
+          reinterpret_cast<ElementD*>(output.data_ptr()),
+          static_cast<ElementBlockScale*>(a_scales.data_ptr()),
+          static_cast<ElementBlockScale*>(b_scales.data_ptr()),
+          // Layout
+          static_cast<int64_t const*>(token_offset.data_ptr()),
+          num_experts, N, K);
+
+  // Set up CUTLASS GEMM arguments
+  Gemm gemm_op;
+
+  UnderlyingProblemShape* problem_sizes_as_shapes =
+      static_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr());
+
+  typename GemmKernel::MainloopArguments mainloop_args{
+      reinterpret_cast<const ElementAB**>(a_ptrs.data_ptr()),
+      static_cast<StrideA*>(a_strides_t.data_ptr()),
+      reinterpret_cast<const ElementAB**>(b_ptrs.data_ptr()),
+      static_cast<StrideB*>(b_strides_t.data_ptr()),
+      reinterpret_cast<const ElementBlockScale**>(a_sf_ptrs.data_ptr()),
+      reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),
+      reinterpret_cast<const ElementBlockScale**>(b_sf_ptrs.data_ptr()),
+      reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr())};
+
+  typename GemmKernel::EpilogueArguments epilogue_args{
+      {},
+      nullptr,
+      static_cast<StrideC*>(c_strides_t.data_ptr()),
+      reinterpret_cast<ElementD**>(out_ptrs.data_ptr()),
+      static_cast<StrideD*>(c_strides_t.data_ptr())};
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = a_fp8.get_device();
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+          hw_info.device_id);
+
+  typename GemmKernel::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {num_experts, problem_sizes_as_shapes, nullptr},
+      mainloop_args, epilogue_args, hw_info};
+
+  TORCH_CHECK(gemm_op.can_implement(args) == cutlass::Status::kSuccess,
+              "SM120 FP8 blockscale MOE GEMM: CUTLASS cannot implement "
+              "the given problem shape");
+
+  size_t workspace_size = gemm_op.get_workspace_size(args);
+  auto workspace = torch::empty(
+      {static_cast<int64_t>(workspace_size)}, opts_byte);
+
+  auto status = gemm_op.initialize(args, workspace.data_ptr());
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "SM120 FP8 blockscale MOE GEMM: initialization failed");
+
+  status = gemm_op.run(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "SM120 FP8 blockscale MOE GEMM: execution failed");
 }
 
-// C++ interface: Online BF16 → FP8 + E8M0 quantization for MOE activations
-//
-// Arguments:
-//   fp8_output    : [M_total, K]       FP8 E4M3 output
-//   scale_output  : [sf_K, scale_ld]   int32 packed E8M0 scales
-//   input         : [M_total, K]       BF16 input
-//   token_offset  : [num_experts + 1]  int64 cumulative token offsets
-//   num_experts   : number of experts
+// ============================================================================
+// Online BF16 → FP8 + FP32 scale quantization for MOE activations
+// ============================================================================
+
 void sm120_fp8_blockscale_quant_a(torch::Tensor& fp8_output,
                                    torch::Tensor& scale_output,
                                    torch::Tensor const& input,
@@ -125,6 +319,8 @@ void sm120_fp8_blockscale_quant_a(torch::Tensor& fp8_output,
   int64_t K = input.size(1);
 
   TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+
+  if (M_total == 0) return;
 
   constexpr int WarpsPerBlock = 4;
   constexpr int ThreadsPerBlock = WarpsPerBlock * 32;
@@ -144,10 +340,8 @@ void sm120_fp8_blockscale_quant_a(torch::Tensor& fp8_output,
               "sm120_fp8_blockscale_quant_a: too many experts (",
               num_experts, "), shared memory exceeds 48KB limit");
 
-  // Scale leading dimension (padded M)
-  int64_t m_padded =
-      (M_total + num_experts * 3) / 4 * 4;  // match compute_padded_offset
-  int64_t scale_leading_dim = m_padded;
+  // Scale K stride: M_total (column-major layout [M, ceil(K/128)])
+  int64_t scale_k_stride = M_total;
 
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -155,10 +349,10 @@ void sm120_fp8_blockscale_quant_a(torch::Tensor& fp8_output,
   scale_1x128_kernel_sm120<__nv_bfloat16, __nv_fp8_e4m3, WarpsPerBlock>
       <<<grid, block, smem_size, stream>>>(
           reinterpret_cast<__nv_fp8_e4m3*>(fp8_output.data_ptr()),
-          reinterpret_cast<int32_t*>(scale_output.data_ptr()),
+          static_cast<float*>(scale_output.data_ptr()),
           reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
           static_cast<int64_t const*>(token_offset.data_ptr()),
-          num_experts, K, scale_leading_dim);
+          num_experts, K, scale_k_stride);
 }
 
 // Register implementations with PyTorch dispatch

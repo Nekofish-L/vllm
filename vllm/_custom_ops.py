@@ -3543,14 +3543,15 @@ def sm120_fp8_blockscale_moe_gemm(
     SM120 FP8 block-scale MOE grouped GEMM.
 
     Performs a grouped matrix multiplication across multiple experts using
-    FP8 E4M3 data with E8M0 block scales on SM120 (Blackwell GeForce).
+    FP8 E4M3 data with FP32 blockwise scales on SM120 (Blackwell GeForce).
+    Uses CUTLASS CollectiveBuilder with Sm120BlockwiseScaleConfig.
 
     Args:
         output: [M_total, N] BF16 output tensor
         a_fp8: [M_total, K] FP8 E4M3 quantized activations
         b_fp8: [num_experts, N, K] FP8 E4M3 expert weights
-        a_scales: [sf_K, pad(M_total)] int32 packed E8M0 scales for A
-        b_scales: [num_experts, pad(N), sf_K] int32 packed E8M0 scales for B
+        a_scales: [M_total, ceil(K/128)] FP32 blockwise scales for A
+        b_scales: [num_experts, N, ceil(K/128)] FP32 blockwise scales for B
         token_offset: [num_experts + 1] int64 cumulative token offsets
     """
     torch.ops._moe_C.sm120_fp8_blockscale_moe_gemm(
@@ -3566,14 +3567,15 @@ def sm120_fp8_blockscale_quant_a(
     num_experts: int,
 ) -> None:
     """
-    SM120 online BF16 → FP8+E8M0 quantization for MOE activations.
+    SM120 online BF16 → FP8+FP32 quantization for MOE activations.
 
-    Quantizes BF16 activation tokens to FP8 E4M3 format with UE8M0 block
-    scales. Supports MOE-aware scale layout using per-expert padding.
+    Quantizes BF16 activation tokens to FP8 E4M3 format with FP32 block
+    scales. Scale layout is column-major [M, ceil(K/128)] matching
+    CUTLASS Sm120BlockwiseScaleConfig's deduce_layoutSFA.
 
     Args:
         fp8_output: [M_total, K] FP8 E4M3 output tensor
-        scale_output: [sf_K, scale_leading_dim] int32 packed E8M0 scales
+        scale_output: [M_total, ceil(K/128)] FP32 blockwise scales
         input: [M_total, K] BF16 input tensor
         token_offset: [num_experts + 1] int64 cumulative token offsets
         num_experts: number of experts

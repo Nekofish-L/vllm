@@ -140,7 +140,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor token_offset) -> ()");
   // conditionally compiled - impl registration in sm120_blockscale_moe_entry.cu
 
-  // SM120 online BF16 → FP8+E8M0 quantization for MOE activations
+  // SM120 online BF16 → FP8+FP32 scale quantization for MOE activations
   m.def(
       "sm120_fp8_blockscale_quant_a(Tensor! fp8_output, "
       "Tensor! scale_output, Tensor input, "
