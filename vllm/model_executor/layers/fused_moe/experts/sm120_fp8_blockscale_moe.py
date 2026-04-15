@@ -126,6 +126,9 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        # Use compute_aligned_M instead of M*topk because
+        # deepgemm_moe_permute rounds up each expert's token count to
+        # the block_m alignment, making the total larger than M*topk.
         assert self.quant_config.block_shape is not None
         block_m = self.quant_config.block_shape[0]
         M_sum = compute_aligned_M(
