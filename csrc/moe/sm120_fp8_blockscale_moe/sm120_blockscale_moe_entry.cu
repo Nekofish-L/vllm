@@ -40,11 +40,13 @@ using namespace cute;
 // ============================================================================
 // Helper kernel: set up per-expert pointer arrays for grouped GEMM
 // ============================================================================
-template <typename ElementAB, typename ElementD, typename ElementSF>
+template <typename ElementAB, typename ElementD, typename ElementSF,
+          typename LayoutSFA, typename LayoutSFB, typename ScaleConfig>
 __global__ void setup_group_gemm_pointers(
     ElementAB** a_ptrs, ElementAB** b_ptrs, ElementD** out_ptrs,
-    ElementSF** a_sf_ptrs, ElementSF** b_sf_ptrs, int64_t* a_strides,
-    int64_t* b_strides, int64_t* c_strides, int32_t* problem_sizes_out,
+    ElementSF** a_sf_ptrs, ElementSF** b_sf_ptrs, LayoutSFA* layout_sfa_out,
+    LayoutSFB* layout_sfb_out, int64_t* a_strides, int64_t* b_strides,
+    int64_t* c_strides, int32_t* problem_sizes_out,
     // Base pointers
     ElementAB* a_base, ElementAB* b_base, ElementD* out_base,
     ElementSF* a_sf_base, ElementSF* b_sf_base,
@@ -66,10 +68,8 @@ __global__ void setup_group_gemm_pointers(
   // Output: [M_total, N] row-major
   out_ptrs[expert_id] = out_base + start * N;
 
-  // A scale factors: contiguous column-major [M_total, ceil(K/128)].
-  // ptr_SFA[i] points to the start of expert i's rows in the global buffer.
-  // The shared layout_SFA (computed on host with M=M_total) provides the
-  // stride (1, M_total) so offsets are correct within the global buffer.
+  // A scale factors: contiguous [M_total, ceil(K/128)] buffer.
+  // ptr_SFA[i] points to the start of expert i's rows.
   a_sf_ptrs[expert_id] = a_sf_base + start;
 
   // B scale factors: [num_experts, N, ceil(K/128)] — each expert's scale
@@ -87,6 +87,15 @@ __global__ void setup_group_gemm_pointers(
   problem_sizes_out[expert_id * 3 + 0] = m;
   problem_sizes_out[expert_id * 3 + 1] = N;
   problem_sizes_out[expert_id * 3 + 2] = K;
+
+  // Per-group scale factor layouts (CUTLASS deduced from per-expert M).
+  // The SM120 blockwise PtrArray collective indexes layout_SFA[batch] and
+  // layout_SFB[batch] to get the layout for each expert, so these must be
+  // stored as per-group arrays on GPU.
+  layout_sfa_out[expert_id] =
+      ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, N, K, 1));
+  layout_sfb_out[expert_id] =
+      ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, N, K, 1));
 }
 
 // ============================================================================
@@ -169,8 +178,8 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
 
   using CollectiveMainloop =
       typename cutlass::gemm::collective::CollectiveBuilder<
-          ArchTag, OperatorClass, ElementAB, cute::tuple<LayoutA*, LayoutSFA>,
-          AlignmentA, ElementAB, cute::tuple<LayoutB*, LayoutSFB>, AlignmentB,
+          ArchTag, OperatorClass, ElementAB, cute::tuple<LayoutA*, LayoutSFA*>,
+          AlignmentA, ElementAB, cute::tuple<LayoutB*, LayoutSFB*>, AlignmentB,
           ElementAccumulator, MmaTileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
@@ -200,19 +209,29 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
   auto out_ptrs = torch::empty({num_experts}, opts_long);
   auto a_sf_ptrs = torch::empty({num_experts}, opts_long);
   auto b_sf_ptrs = torch::empty({num_experts}, opts_long);
+  // Allocate raw byte storage for per-group CUTLASS layout structs.
+  // The SM120 blockwise PtrArray collective indexes layout_SFA[batch] to
+  // get the per-expert layout, so we need one layout struct per expert.
+  auto layout_sfa_t = torch::empty(
+      {static_cast<int64_t>(num_experts * sizeof(LayoutSFA))}, opts_byte);
+  auto layout_sfb_t = torch::empty(
+      {static_cast<int64_t>(num_experts * sizeof(LayoutSFB))}, opts_byte);
   auto a_strides_t = torch::empty({num_experts}, opts_long);
   auto b_strides_t = torch::empty({num_experts}, opts_long);
   auto c_strides_t = torch::empty({num_experts}, opts_long);
   auto problem_sizes = torch::empty({num_experts * 3}, opts_int);
 
   // Launch pointer setup kernel
-  setup_group_gemm_pointers<ElementAB, ElementD, ElementBlockScale>
+  setup_group_gemm_pointers<ElementAB, ElementD, ElementBlockScale, LayoutSFA,
+                            LayoutSFB, ScaleConfig>
       <<<1, num_experts, 0, stream>>>(
           reinterpret_cast<ElementAB**>(a_ptrs.data_ptr()),
           reinterpret_cast<ElementAB**>(b_ptrs.data_ptr()),
           reinterpret_cast<ElementD**>(out_ptrs.data_ptr()),
           reinterpret_cast<ElementBlockScale**>(a_sf_ptrs.data_ptr()),
           reinterpret_cast<ElementBlockScale**>(b_sf_ptrs.data_ptr()),
+          reinterpret_cast<LayoutSFA*>(layout_sfa_t.data_ptr()),
+          reinterpret_cast<LayoutSFB*>(layout_sfb_t.data_ptr()),
           static_cast<int64_t*>(a_strides_t.data_ptr()),
           static_cast<int64_t*>(b_strides_t.data_ptr()),
           static_cast<int64_t*>(c_strides_t.data_ptr()),
@@ -227,17 +246,6 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
           static_cast<int64_t const*>(token_offset.data_ptr()), num_experts, N,
           K);
 
-  // Compute shared scale factor layouts on the host.
-  // The SM120 blockwise PtrArray mainloop uses a SINGLE shared layout
-  // (not per-group layout pointers), unlike OpClassBlockScaledTensorOp.
-  // For A scales: the global buffer is column-major [M_total, K/128], so
-  // using M_total as M gives the correct stride (1, M_total).
-  // For B scales: layout depends only on N and K (same for all experts).
-  LayoutSFA layout_sfa =
-      ScaleConfig::tile_atom_to_shape_SFA(make_shape(M_total, N, K, 1));
-  LayoutSFB layout_sfb =
-      ScaleConfig::tile_atom_to_shape_SFB(make_shape(M_total, N, K, 1));
-
   // Set up CUTLASS GEMM arguments
   Gemm gemm_op;
 
@@ -250,9 +258,9 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
       reinterpret_cast<const ElementAB**>(b_ptrs.data_ptr()),
       static_cast<StrideB*>(b_strides_t.data_ptr()),
       reinterpret_cast<const ElementBlockScale**>(a_sf_ptrs.data_ptr()),
-      layout_sfa,
+      reinterpret_cast<LayoutSFA*>(layout_sfa_t.data_ptr()),
       reinterpret_cast<const ElementBlockScale**>(b_sf_ptrs.data_ptr()),
-      layout_sfb};
+      reinterpret_cast<LayoutSFB*>(layout_sfb_t.data_ptr())};
 
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
