@@ -132,6 +132,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   // DeepSeek V3 optimized router GEMM for SM90+
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   // conditionally compiled so impl registration is in source file
+
+  // SM120 FP8 block-scale MOE GEMM (Blackwell GeForce)
+  m.def(
+      "sm120_fp8_blockscale_moe_gemm(Tensor! output, Tensor a_fp8, "
+      "Tensor b_fp8, Tensor a_scales, Tensor b_scales, "
+      "Tensor token_offset) -> ()");
+  // conditionally compiled - impl registration in sm120_blockscale_moe_entry.cu
+
+  // SM120 online BF16 → FP8+E8M0 quantization for MOE activations
+  m.def(
+      "sm120_fp8_blockscale_quant_a(Tensor! fp8_output, "
+      "Tensor! scale_output, Tensor input, "
+      "Tensor token_offset, int num_experts) -> ()");
+  // conditionally compiled - impl registration in sm120_blockscale_moe_entry.cu
 #endif
 }
 

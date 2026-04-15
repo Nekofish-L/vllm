@@ -1162,6 +1162,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
                    " in CUDA target architectures")
   endif()
 
+  # SM120 FP8 block-scale MOE GEMM kernel - requires SM120 and CUDA 12.8+
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(SM120_MOE_ARCHS "12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(SM120_MOE_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SM120_MOE_ARCHS)
+    set(SM120_MOE_SRC
+      "csrc/moe/sm120_fp8_blockscale_moe/sm120_blockscale_moe_entry.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SM120_MOE_SRC}"
+      CUDA_ARCHS "${SM120_MOE_ARCHS}")
+    list(APPEND VLLM_MOE_EXT_SRC "${SM120_MOE_SRC}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_SM120_MOE=1")
+    message(STATUS "Building SM120 FP8 block-scale MOE kernel for archs: ${SM120_MOE_ARCHS}")
+  else()
+    message(STATUS "Not building SM120 FP8 block-scale MOE kernel as no compatible archs found"
+                   " (requires SM120 and CUDA >= 12.8)")
+  endif()
+
   # DeepSeek V3 router GEMM kernel - requires SM90+
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(DSV3_ROUTER_GEMM_ARCHS "9.0a;10.0f;11.0f" "${CUDA_ARCHS}")

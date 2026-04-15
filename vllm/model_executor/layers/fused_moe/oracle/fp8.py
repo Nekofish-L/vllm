@@ -54,6 +54,7 @@ class Fp8MoeBackend(Enum):
     AITER = "AITER"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     BATCHED_VLLM_CUTLASS = "BATCHED_VLLM_CUTLASS"
+    SM120_BLOCKSCALE = "SM120_BLOCKSCALE"
     XPU = "XPU"
 
 
@@ -72,6 +73,7 @@ def _get_priority_backends(
         Fp8MoeBackend.AITER,
         Fp8MoeBackend.FLASHINFER_TRTLLM,
         Fp8MoeBackend.FLASHINFER_CUTLASS,
+        Fp8MoeBackend.SM120_BLOCKSCALE,
         Fp8MoeBackend.DEEPGEMM,
         Fp8MoeBackend.VLLM_CUTLASS,
         Fp8MoeBackend.TRITON,
@@ -122,6 +124,13 @@ def backend_to_kernel_cls(
         )
 
         return [FlashInferExperts]
+
+    elif backend == Fp8MoeBackend.SM120_BLOCKSCALE:
+        from vllm.model_executor.layers.fused_moe.experts.sm120_fp8_blockscale_moe import (
+            SM120BlockscaleMoEExperts,
+        )
+
+        return [SM120BlockscaleMoEExperts]
 
     elif backend == Fp8MoeBackend.DEEPGEMM:
         from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
@@ -200,6 +209,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
         "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
         "marlin": Fp8MoeBackend.MARLIN,
         "aiter": Fp8MoeBackend.AITER,
+        "sm120_blockscale": Fp8MoeBackend.SM120_BLOCKSCALE,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -477,6 +487,7 @@ def convert_to_fp8_moe_kernel_format(
             Fp8MoeBackend.BATCHED_TRITON,
             Fp8MoeBackend.VLLM_CUTLASS,
             Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
+            Fp8MoeBackend.SM120_BLOCKSCALE,
             Fp8MoeBackend.XPU,
         ]:
             raise ValueError(f"Unsupported FP8 MoE backend: {fp8_backend.value}")
