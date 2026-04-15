@@ -1,27 +1,292 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Tests for the SM120 expert token counting fix.
+Tests for the SM120 FP8 block-scale MOE expert backend.
 
-Verifies that:
-1. compute_aligned_M produces correct aligned workspace sizes
-2. count_expert_num_tokens correctly counts tokens from topk_ids
-   (replacing the old torch.bincount(expert_ids) approach which failed
-   when expert_ids contained -1 padding values from deepgemm_moe_permute)
-3. token_offset cumsum computation works end-to-end with both
-   expert_tokens_meta and fallback paths
+Covers:
+1. Utility functions: compute_aligned_M, expert_num_tokens_round_up_and_sum,
+   count_expert_num_tokens
+2. SM120BlockscaleMoEExperts class: static capability checks, construction
+   validation, workspace_shapes correctness
+3. Regression guard: torch.bincount fails on -1 padded expert_ids
 
 Run: pytest tests/kernels/moe/test_sm120_expert_token_counting.py -v
 """
 
+import math
+
 import pytest
 import torch
 
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+    RoutingMethodType,
+)
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     compute_aligned_M,
     expert_num_tokens_round_up_and_sum,
 )
+from vllm.model_executor.layers.fused_moe.experts.sm120_fp8_blockscale_moe import (
+    SM120BlockscaleMoEExperts,
+)
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+    kFp8Static128BlockSym,
+)
+
+BLOCK_SHAPE = [128, 128]
+
+
+def _make_moe_config(
+    num_experts: int = 8,
+    experts_per_token: int = 2,
+    hidden_dim: int = 256,
+    intermediate_size: int = 512,
+) -> FusedMoEConfig:
+    """Helper to build a FusedMoEConfig for SM120 tests."""
+    return FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=experts_per_token,
+        hidden_dim=hidden_dim,
+        intermediate_size_per_partition=intermediate_size,
+        num_local_experts=num_experts,
+        num_logical_experts=num_experts,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.SILU,
+        in_dtype=torch.bfloat16,
+        device="cuda",
+        routing_method=RoutingMethodType.TopK,
+        max_num_tokens=512,
+    )
+
+
+def _make_quant_config(
+    num_experts: int = 8,
+    N: int = 512,
+    K: int = 256,
+) -> FusedMoEQuantConfig:
+    """Helper to build an FP8 block-scale quant config for SM120 tests."""
+    block_n, block_k = BLOCK_SHAPE
+    n_tiles_w1 = math.ceil((2 * N) / block_n)
+    k_tiles_w1 = math.ceil(K / block_k)
+    n_tiles_w2 = math.ceil(K / block_n)
+    k_tiles_w2 = math.ceil(N / block_k)
+
+    w1_scale = torch.ones(
+        num_experts, n_tiles_w1, k_tiles_w1, device="cuda", dtype=torch.float32
+    )
+    w2_scale = torch.ones(
+        num_experts, n_tiles_w2, k_tiles_w2, device="cuda", dtype=torch.float32
+    )
+
+    return FusedMoEQuantConfig.make(
+        quant_dtype=torch.float8_e4m3fn,
+        block_shape=BLOCK_SHAPE,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+    )
+
+
+def _make_sm120_experts(
+    num_experts: int = 8,
+    N: int = 512,
+    K: int = 256,
+) -> SM120BlockscaleMoEExperts:
+    """Construct an SM120BlockscaleMoEExperts instance for testing."""
+    moe_config = _make_moe_config(
+        num_experts=num_experts, hidden_dim=K, intermediate_size=N
+    )
+    quant_config = _make_quant_config(num_experts=num_experts, N=N, K=K)
+    return SM120BlockscaleMoEExperts(moe_config=moe_config, quant_config=quant_config)
+
+
+# ===========================================================================
+# Section 1: SM120BlockscaleMoEExperts class-level tests
+# ===========================================================================
+
+
+class TestSM120StaticMethods:
+    """Tests for SM120BlockscaleMoEExperts static capability queries."""
+
+    def test_activation_format_is_standard(self):
+        assert (
+            SM120BlockscaleMoEExperts.activation_format()
+            == mk.FusedMoEActivationFormat.Standard
+        )
+
+    def test_supports_no_act_and_mul_is_false(self):
+        assert SM120BlockscaleMoEExperts._supports_no_act_and_mul() is False
+
+    def test_supports_silu_activation(self):
+        assert SM120BlockscaleMoEExperts._supports_activation(MoEActivation.SILU)
+
+    def test_supports_swiglustep_activation(self):
+        assert SM120BlockscaleMoEExperts._supports_activation(MoEActivation.SWIGLUSTEP)
+
+    @pytest.mark.parametrize(
+        "activation",
+        [MoEActivation.GELU, MoEActivation.IDENTITY],
+    )
+    def test_rejects_unsupported_activations(self, activation: MoEActivation):
+        assert not SM120BlockscaleMoEExperts._supports_activation(activation)
+
+    def test_supports_correct_quant_scheme(self):
+        assert SM120BlockscaleMoEExperts._supports_quant_scheme(
+            kFp8Static128BlockSym, kFp8Dynamic128Sym
+        )
+
+    def test_rejects_wrong_quant_scheme(self):
+        assert not SM120BlockscaleMoEExperts._supports_quant_scheme(None, None)
+        assert not SM120BlockscaleMoEExperts._supports_quant_scheme(
+            kFp8Dynamic128Sym, kFp8Dynamic128Sym
+        )
+
+    def test_supports_ep_size_1_only(self):
+        no_parallel = FusedMoEParallelConfig.make_no_parallel()
+        assert SM120BlockscaleMoEExperts._supports_parallel_config(no_parallel)
+
+    def test_rejects_ep_size_gt_1(self):
+        ep_config = FusedMoEParallelConfig(
+            tp_size=1, dp_size=1, ep_size=2, tp_rank=0, dp_rank=0, ep_rank=0
+        )
+        assert not SM120BlockscaleMoEExperts._supports_parallel_config(ep_config)
+
+
+class TestSM120Construction:
+    """Tests for SM120BlockscaleMoEExperts construction and validation."""
+
+    def test_construction_succeeds_with_valid_config(self):
+        experts = _make_sm120_experts()
+        assert experts is not None
+        assert experts.supports_expert_map() is True
+
+    def test_construction_rejects_non_fp8_quant(self):
+        moe_config = _make_moe_config()
+        bad_quant = FusedMoEQuantConfig.make(
+            quant_dtype=torch.int8,
+            block_shape=BLOCK_SHAPE,
+            w1_scale=torch.ones(8, 8, 2, device="cuda"),
+            w2_scale=torch.ones(8, 2, 4, device="cuda"),
+        )
+        with pytest.raises(AssertionError):
+            SM120BlockscaleMoEExperts(moe_config=moe_config, quant_config=bad_quant)
+
+    def test_construction_rejects_wrong_block_shape(self):
+        moe_config = _make_moe_config()
+        bad_quant = FusedMoEQuantConfig.make(
+            quant_dtype=torch.float8_e4m3fn,
+            block_shape=[64, 64],
+            w1_scale=torch.ones(8, 16, 4, device="cuda"),
+            w2_scale=torch.ones(8, 4, 8, device="cuda"),
+        )
+        with pytest.raises(AssertionError):
+            SM120BlockscaleMoEExperts(moe_config=moe_config, quant_config=bad_quant)
+
+    def test_construction_rejects_per_act_token_quant(self):
+        moe_config = _make_moe_config()
+        bad_quant = FusedMoEQuantConfig.make(
+            quant_dtype=torch.float8_e4m3fn,
+            per_act_token_quant=True,
+            w1_scale=torch.ones(8, 1, 1, device="cuda"),
+            w2_scale=torch.ones(8, 1, 1, device="cuda"),
+        )
+        with pytest.raises(AssertionError):
+            SM120BlockscaleMoEExperts(moe_config=moe_config, quant_config=bad_quant)
+
+
+class TestSM120WorkspaceShapes:
+    """Tests for workspace_shapes correctness."""
+
+    @pytest.mark.parametrize("M", [1, 32, 128, 256])
+    @pytest.mark.parametrize("topk", [1, 2, 4])
+    def test_workspace_shapes_no_meta(self, M: int, topk: int):
+        """workspace_shapes must produce buffers large enough for the aligned
+        M_sum that deepgemm_moe_permute will compute."""
+        E, N, K = 8, 512, 256
+        experts = _make_sm120_experts(num_experts=E, N=N, K=K)
+
+        ws1, ws2, out = experts.workspace_shapes(
+            M=M,
+            N=2 * N,
+            K=K,
+            topk=topk,
+            global_num_experts=E,
+            local_num_experts=E,
+            expert_tokens_meta=None,
+            activation=MoEActivation.SILU,
+        )
+
+        # Output must be (M, K)
+        assert out == (M, K)
+
+        # First dim of workspace1 and workspace2 must be >= M*topk
+        assert ws1[0] >= M * topk
+        assert ws2[0] >= M * topk
+
+        # Must be aligned to block_m=128
+        assert ws1[0] % 128 == 0
+        assert ws2[0] % 128 == 0
+
+        # Second dim of workspace1 must fit max(activation_out_dim, K)
+        # For SILU: activation_out_dim = 2*N / 2 = N
+        assert ws1[1] >= max(N, K)
+
+        # Second dim of workspace2 must fit max(2*N, K)
+        assert ws2[1] >= max(2 * N, K)
+
+    def test_workspace_shapes_with_meta(self):
+        """workspace_shapes with expert_tokens_meta should use the actual
+        per-expert counts for a tighter allocation."""
+        E, N, K = 4, 512, 256
+        experts = _make_sm120_experts(num_experts=E, N=N, K=K)
+
+        expert_counts = torch.tensor([10, 20, 5, 30], dtype=torch.int32)
+        meta = mk.ExpertTokensMetadata(
+            expert_num_tokens=expert_counts.to("cuda"),
+            expert_num_tokens_cpu=expert_counts,
+        )
+
+        ws1, ws2, out = experts.workspace_shapes(
+            M=65,
+            N=2 * N,
+            K=K,
+            topk=1,
+            global_num_experts=E,
+            local_num_experts=E,
+            expert_tokens_meta=meta,
+            activation=MoEActivation.SILU,
+        )
+
+        expected_M_sum = expert_num_tokens_round_up_and_sum(expert_counts, 128)
+        assert ws1[0] == expected_M_sum
+        assert ws2[0] == expected_M_sum
+        assert out == (65, K)
+
+    def test_finalize_returns_no_op(self):
+        """SM120 uses TopKWeightAndReduceNoOP for its weight/reduce step."""
+        from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+            TopKWeightAndReduceNoOP,
+        )
+
+        experts = _make_sm120_experts()
+        wr = experts.finalize_weight_and_reduce_impl()
+        assert isinstance(wr, TopKWeightAndReduceNoOP)
+
+    def test_workspace_dtype_passthrough(self):
+        """workspace_dtype should return the same dtype as the input."""
+        experts = _make_sm120_experts()
+        assert experts.workspace_dtype(torch.bfloat16) == torch.bfloat16
+        assert experts.workspace_dtype(torch.float16) == torch.float16
+
+
+# ===========================================================================
+# Section 2: Utility function tests
+# ===========================================================================
 
 # ---- Tests for compute_aligned_M ----
 
@@ -48,8 +313,6 @@ def test_compute_aligned_M_no_meta(
 def test_compute_aligned_M_with_meta(alignment: int):
     """compute_aligned_M with expert_tokens_meta uses the actual per-expert
     token counts instead of the worst-case estimate."""
-    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-
     expert_num_tokens = torch.tensor([10, 20, 30, 5], dtype=torch.int32)
     meta = mk.ExpertTokensMetadata(
         expert_num_tokens=expert_num_tokens.to("cuda"),
@@ -143,7 +406,7 @@ def test_count_expert_num_tokens_with_expert_map():
     num_local_experts = 4
     ep_rank = 1  # owns experts 4, 5, 6, 7
 
-    # Build expert_map: maps global expert index → local expert index
+    # Build expert_map: maps global expert index -> local expert index
     expert_map = torch.full((num_global_experts,), -1, dtype=torch.int32, device="cuda")
     start = ep_rank * num_local_experts
     for i in range(num_local_experts):
@@ -159,10 +422,10 @@ def test_count_expert_num_tokens_with_expert_map():
     counts = count_expert_num_tokens(topk_ids, num_local_experts, expert_map)
 
     # Expected local counts:
-    #   local 0 (global 4): tokens 0, 2 → 2
-    #   local 1 (global 5): tokens 1, 3 → 2
-    #   local 2 (global 6): token 0 → 1
-    #   local 3 (global 7): token 1 → 1
+    #   local 0 (global 4): tokens 0, 2 -> 2
+    #   local 1 (global 5): tokens 1, 3 -> 2
+    #   local 2 (global 6): token 0 -> 1
+    #   local 3 (global 7): token 1 -> 1
     expected = torch.tensor([2, 2, 1, 1], dtype=torch.int32, device="cuda")
     torch.testing.assert_close(counts, expected, atol=0, rtol=0)
 
