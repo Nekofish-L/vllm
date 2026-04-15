@@ -214,12 +214,12 @@ void sm120_fp8_blockscale_moe_gemm(torch::Tensor& output,
   auto out_ptrs = torch::empty({num_experts}, opts_long);
   auto a_sf_ptrs = torch::empty({num_experts}, opts_long);
   auto b_sf_ptrs = torch::empty({num_experts}, opts_long);
+  // Allocate raw byte storage for CUTLASS layout structs (LayoutSFA/SFB).
+  // Using byte tensors avoids assumptions about struct size in int64_t units.
   auto layout_sfa = torch::empty(
-      {num_experts, static_cast<int>(sizeof(LayoutSFA) / sizeof(int64_t))},
-      opts_long);
+      {static_cast<int64_t>(num_experts * sizeof(LayoutSFA))}, opts_byte);
   auto layout_sfb = torch::empty(
-      {num_experts, static_cast<int>(sizeof(LayoutSFB) / sizeof(int64_t))},
-      opts_long);
+      {static_cast<int64_t>(num_experts * sizeof(LayoutSFB))}, opts_byte);
   auto a_strides_t = torch::empty({num_experts}, opts_long);
   auto b_strides_t = torch::empty({num_experts}, opts_long);
   auto c_strides_t = torch::empty({num_experts}, opts_long);

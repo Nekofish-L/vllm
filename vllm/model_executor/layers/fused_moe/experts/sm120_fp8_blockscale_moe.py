@@ -238,9 +238,9 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
             for i in range(local_num_experts):
                 expert_num_tokens[i] = expert_tokens_meta.expert_num_tokens[i].item()
         else:
-            for i in range(local_num_experts):
-                mask = expert_ids == i
-                expert_num_tokens[i] = mask.sum().item()
+            expert_num_tokens = torch.bincount(
+                expert_ids, minlength=local_num_experts
+            ).to(torch.long)
 
         token_offset = torch.zeros(
             local_num_experts + 1,
