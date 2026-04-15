@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+    compute_aligned_M,
     deepgemm_moe_permute,
     deepgemm_unpermute_and_reduce,
 )
@@ -125,10 +126,14 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        M_total = M * topk
+        assert self.quant_config.block_shape is not None
+        block_m = self.quant_config.block_shape[0]
+        M_sum = compute_aligned_M(
+            M, topk, local_num_experts, block_m, expert_tokens_meta
+        )
         activation_out_dim = self.adjust_N_for_activation(N, activation)
-        workspace1 = (M_total, max(activation_out_dim, K))
-        workspace2 = (M_total, max(N, K))
+        workspace1 = (M_sum, max(activation_out_dim, K))
+        workspace2 = (M_sum, max(N, K))
         output = (M, K)
         return (workspace1, workspace2, output)
 
@@ -210,14 +215,20 @@ class SM120BlockscaleMoEExperts(mk.FusedMoEExpertsModular):
 
         M = topk_ids.size(0)
         topk = topk_ids.size(1)
-        M_total = M * topk
 
         assert w2.size(1) == K
         assert w1.dtype == torch.float8_e4m3fn
         assert w2.dtype == torch.float8_e4m3fn
 
+        # Compute aligned M_sum matching deepgemm_moe_permute's expectation
+        assert self.quant_config.block_shape is not None
+        block_m = self.quant_config.block_shape[0]
+        M_sum = compute_aligned_M(
+            M, topk, local_num_experts, block_m, expert_tokens_meta
+        )
+
         # Step 1: Permute tokens by expert assignment
-        a1q_perm = _resize_cache(workspace13.view(dtype=a1q.dtype), (M_total, K))
+        a1q_perm = _resize_cache(workspace13.view(dtype=a1q.dtype), (M_sum, K))
         a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
