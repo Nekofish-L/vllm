@@ -48,12 +48,21 @@ using namespace cute;
 constexpr auto FLOAT4_E2M1X2 = torch::headeronly::ScalarType::Byte;
 constexpr auto SF_DTYPE = torch::headeronly::ScalarType::Float8_e4m3fn;
 
+// Configuration for M in [1, 32] - uses larger K tile for better throughput
+struct sm120_fp4_config_small_m {
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _256>;
+  using PerSmTileShape_MNK = Shape<_128, _128, _256>;
+};
+
+// Configuration for M in (32, 256]
 struct sm120_fp4_config_M256 {
   using ClusterShape = Shape<_1, _1, _1>;
   using MmaTileShape = Shape<_128, _128, _128>;
   using PerSmTileShape_MNK = Shape<_128, _128, _128>;
 };
 
+// Configuration for M in (256, inf)
 struct sm120_fp4_config_default {
   using ClusterShape = Shape<_1, _1, _1>;
   using MmaTileShape = Shape<_256, _128, _128>;
@@ -188,7 +197,10 @@ void cutlass_fp4_bf16_gemm_dispatch(torch::stable::Tensor& D,
                                     torch::stable::Tensor const& alpha, int m,
                                     int n, int k, cudaStream_t stream) {
   uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
-  if (mp2 <= 256) {
+  if (mp2 <= 32) {
+    runGemm<Fp4GemmSm120<sm120_fp4_config_small_m, cutlass::bfloat16_t>::Gemm>(
+        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  } else if (mp2 <= 256) {
     runGemm<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::bfloat16_t>::Gemm>(
         D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
   } else {
@@ -205,7 +217,10 @@ void cutlass_fp4_f16_gemm_dispatch(torch::stable::Tensor& D,
                                    torch::stable::Tensor const& alpha, int m,
                                    int n, int k, cudaStream_t stream) {
   uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
-  if (mp2 <= 256) {
+  if (mp2 <= 32) {
+    runGemm<Fp4GemmSm120<sm120_fp4_config_small_m, cutlass::half_t>::Gemm>(
+        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  } else if (mp2 <= 256) {
     runGemm<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::half_t>::Gemm>(
         D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
   } else {
