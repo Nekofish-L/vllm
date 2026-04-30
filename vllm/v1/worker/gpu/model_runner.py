@@ -401,6 +401,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_backends,
             self.device,
             self.cache_config.cache_dtype,
+            self.attn_groups,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
