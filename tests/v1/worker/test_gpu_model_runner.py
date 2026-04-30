@@ -1348,7 +1348,6 @@ def test_v2_reshape_kv_cache_hybrid_attention_mamba():
     num_kv_heads = 4
     head_size = 8
     dtype = torch.float16
-    # dtype_size = 2 (float16), not used directly but documents layout
 
     # KV manager block_size = 32 (large, not power of 2 for kernel)
     # Kernel block_size = 16 (FlashInfer-compatible)

@@ -170,7 +170,7 @@ def _update_hybrid_attention_mamba_layout(
                 continue
             if kv_cache.shape[0] == 2:
                 assert kv_cache.shape[1] != 2, (
-                    "Fail to determine whether the layout is "
+                    "Failed to determine whether the layout is "
                     "(2, num_blocks, ...) or (num_blocks, 2, ...) for "
                     f"a tensor of shape {kv_cache.shape}"
                 )
