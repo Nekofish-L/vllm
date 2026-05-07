@@ -57,7 +57,7 @@ class BlockTables:
             if block_size % kernel_block_size != 0:
                 raise ValueError(
                     f"kernel_block_size {kernel_block_size} must divide "
-                    f"kv_manager_block_size {block_size} evenly"
+                    f"block_size {block_size} evenly"
                 )
             blocks_per_kv_block = block_size // kernel_block_size
             self.blocks_per_kv_block.append(blocks_per_kv_block)

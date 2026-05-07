@@ -95,7 +95,9 @@ def reshape_kv_cache_tensors(
                 has_mamba = True
                 state_tensors: list[torch.Tensor] = []
                 storage_offset_bytes = 0
-                for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                for shape, dtype in zip(
+                    kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                ):
                     dtype_size = get_dtype_size(dtype)
                     num_elements_per_page = kv_cache_spec.page_size_bytes // dtype_size
                     target_shape = (num_blocks, *shape)
