@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -25,6 +25,9 @@ from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+if TYPE_CHECKING:
+    from flashinfer.fused_moe import B12xMoEWrapper
 
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
@@ -82,7 +85,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         self._activation_str = self._ACTIVATION_MAP[activation]
 
         # Lazily created on first apply() call.
-        self._wrapper: Any | None = None
+        self._wrapper: "B12xMoEWrapper | None" = None
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
 
@@ -146,10 +149,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        p = current_platform
+        platform = current_platform
         return (
-            p.is_cuda()
-            and p.is_device_capability_family(120)
+            platform.is_cuda()
+            and platform.is_device_capability_family(120)
             and has_flashinfer_b12x_moe()
         )
 
