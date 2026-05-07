@@ -58,8 +58,8 @@ def create_attn_groups(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
 
-        group_map: dict[tuple[str, KVCacheSpec], AttentionGroup] = {}
-        group_order: list[tuple[str, KVCacheSpec]] = []
+        group_map: dict[tuple[tuple[str, str], KVCacheSpec], AttentionGroup] = {}
+        group_order: list[tuple[tuple[str, str], KVCacheSpec]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()

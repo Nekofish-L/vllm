@@ -6691,7 +6691,7 @@ class GPUModelRunner(
 
         Returns:
             Dict[str, torch.Tensor | list[torch.Tensor]]: A map between layer names
-            to theircorresponding memory buffer for KV cache.
+            to their corresponding memory buffer for KV cache.
         """
 
         # Try creating KV caches optimized for kv-connector transfers
