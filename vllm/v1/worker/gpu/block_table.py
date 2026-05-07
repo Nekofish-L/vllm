@@ -24,6 +24,12 @@ class BlockTables:
         cp_rank: int = 0,
         cp_interleave: int = 1,
     ):
+        if len(kernel_block_sizes) != len(block_sizes):
+            raise ValueError(
+                f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
         self.max_num_reqs = max_num_reqs
@@ -34,12 +40,6 @@ class BlockTables:
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
-
-        if len(self.kernel_block_sizes) != len(self.block_sizes):
-            raise ValueError(
-                f"kernel_block_sizes length ({len(self.kernel_block_sizes)}) "
-                f"must match block_sizes length ({len(self.block_sizes)})"
-            )
 
         self.num_kv_cache_groups = len(self.block_sizes)
         if max_num_blocks is None:

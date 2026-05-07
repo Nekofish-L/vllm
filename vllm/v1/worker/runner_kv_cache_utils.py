@@ -30,7 +30,7 @@ def reshape_kv_cache_tensors(
         Dict[str, torch.Tensor]: A map between layer names to their
         corresponding memory buffer for KV cache.
     """
-    groups = tuple(attn_groups)
+    groups = attn_groups if isinstance(attn_groups, tuple) else tuple(attn_groups)
     kv_caches: dict[str, torch.Tensor | list[torch.Tensor]] = {}
     has_attn = False
     has_mamba = False

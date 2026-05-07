@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -157,7 +158,7 @@ def init_kv_cache(
 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = reshape_kv_cache_tensors(
-        attn_groups=(group for group_list in attn_groups for group in group_list),
+        attn_groups=tuple(itertools.chain.from_iterable(attn_groups)),
         kv_cache_raw_tensors=kv_cache_raw_tensors,
         kernel_block_sizes=kernel_block_sizes,
         cache_dtype=cache_dtype,

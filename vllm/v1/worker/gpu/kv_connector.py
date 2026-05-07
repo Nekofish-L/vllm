@@ -60,8 +60,8 @@ class ActiveKVConnector(KVConnector):
         }
         if len(kv_caches_tensors) != len(kv_caches_dict):
             raise NotImplementedError(
-                "ModelRunner v2 KV connectors do not support non-attention "
-                "KV cache tensors yet."
+                "ModelRunner v2 KV connectors do not support list-based "
+                "KV caches yet."
             )
         # Register kv caches with KV Connector if applicable.
         # TODO: support cross_layers_kv_cache
