@@ -95,17 +95,17 @@ def reshape_kv_cache_tensors(
                 has_mamba = True
                 state_tensors: list[torch.Tensor] = []
                 storage_offset_bytes = 0
-                for shape, dtype in zip(
+                for state_shape, state_dtype in zip(
                     kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
                 ):
-                    dtype_size = get_dtype_size(dtype)
+                    dtype_size = get_dtype_size(state_dtype)
                     num_elements_per_page = kv_cache_spec.page_size_bytes // dtype_size
-                    target_shape = (num_blocks, *shape)
+                    target_shape = (num_blocks, *state_shape)
                     stride = torch.empty(target_shape).stride()
                     target_stride = (num_elements_per_page, *stride[1:])
                     assert storage_offset_bytes % dtype_size == 0
                     tensor = torch.as_strided(
-                        raw_tensor.view(dtype),
+                        raw_tensor.view(state_dtype),
                         size=target_shape,
                         stride=target_stride,
                         storage_offset=storage_offset_bytes // dtype_size,

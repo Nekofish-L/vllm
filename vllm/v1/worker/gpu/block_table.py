@@ -116,7 +116,7 @@ class BlockTables:
             device=self.device,
         )
         self.max_num_blocks_per_group = torch.tensor(
-            [b.gpu.shape[1] for b in self.block_tables],
+            [block_table.gpu.shape[1] for block_table in self.block_tables],
             dtype=torch.int32,
             device=self.device,
         )
