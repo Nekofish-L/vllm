@@ -25,7 +25,7 @@ def reshape_kv_cache_tensors(
             correct size but uninitialized shape.
         kernel_block_sizes: The kernel block sizes for each KV cache group.
         cache_dtype: The dtype of KV cache.
-        skip_layer_names: Layers have no KV cache need to skip.
+        skip_layer_names: Layers that have no KV cache to skip.
     Returns:
         Dict[str, torch.Tensor]: A map between layer names to their
         corresponding memory buffer for KV cache.

@@ -234,7 +234,7 @@ def _gather_block_tables_kernel(
     num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
     num_blocks_stride,
     num_reqs,  # actual number of requests (for padding)
-    max_num_blocks_ptr,  # [num_kv_cache_groups] stride for zeroing padded rows
+    max_num_blocks_ptr,  # [num_kv_cache_groups] max block counts per group
     BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
