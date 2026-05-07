@@ -416,7 +416,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
-
         check_attention_cp_compatibility(self.vllm_config)
         if self.speculator is not None:
             # HACK(woosuk)

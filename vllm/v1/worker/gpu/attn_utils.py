@@ -158,7 +158,7 @@ def init_kv_cache(
 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = reshape_kv_cache_tensors(
-        attn_groups=tuple(itertools.chain.from_iterable(attn_groups)),
+        attn_groups=itertools.chain.from_iterable(attn_groups),
         kv_cache_raw_tensors=kv_cache_raw_tensors,
         kernel_block_sizes=kernel_block_sizes,
         cache_dtype=cache_dtype,
