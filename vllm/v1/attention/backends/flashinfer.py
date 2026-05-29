@@ -577,6 +577,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if speculative_config is not None
             else 0
         )
+        num_spec_tokens = num_spec_tokens or 0
+        spec_decode_query_len = 1 + num_spec_tokens
+        if speculative_config is not None and speculative_config.parallel_drafting:
+            spec_decode_query_len = 1 + 2 * num_spec_tokens
+        self.spec_decode_query_len = spec_decode_query_len
+        max_decode_rows = max_num_reqs * spec_decode_query_len
         self.enable_cuda_graph = (
             self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         )
@@ -586,7 +592,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._decode_wrappers_cudagraph: dict[
                 int, BatchDecodeWithPagedKVCacheWrapper
             ] = {}
-            self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
+            self._decode_cudagraph_max_bs = max_decode_rows
             if self.compilation_config.max_cudagraph_capture_size is not None:
                 self._decode_cudagraph_max_bs = min(
                     self._decode_cudagraph_max_bs,
@@ -659,7 +665,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
         self.use_trtllm_decode_attention = can_use_trtllm
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=can_use_trtllm)
+        self.use_native_spec_decode = not can_use_trtllm and not self.use_dcp
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=can_use_trtllm or self.use_native_spec_decode,
+        )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
 
@@ -685,12 +695,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.pin_memory = (
             not vllm_config.use_v2_model_runner and is_pin_memory_available()
         )
-        self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
+        self.paged_kv_indptr = self._make_buffer(max_decode_rows + 1)
         self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
             self.paged_kv_indptr.cpu, pin_memory=self.pin_memory
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
-        self.paged_kv_indices = self._make_buffer(max_num_pages)
-        self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+        self.paged_kv_indices = self._make_buffer(
+            max_num_pages * spec_decode_query_len
+        )
+        self.paged_kv_last_page_len = self._make_buffer(max_decode_rows)
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype = torch.int32
@@ -712,11 +724,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> AttentionCGSupport:
         """Get the cudagraph support level for FlashInfer attention.
 
-        This depends on whether we can use TRTLLM attention for decodes, since we can
-        only do UNIFORM_SINGLE_TOKEN_DECODE if it is unavailable.
-        To check this, we must call can_use_trtllm_attention with the number of KV
-        heads from the kv_cache_spec. We check all available KV cache specs and
-        only return UNIFORM_BATCH if all of them support TRTLLM attention.
+        TRTLLM decode supports uniform batches directly. Native FlashInfer decode
+        supports them by expanding multi-token verify requests into single-token
+        decode rows. DCP native decode still uses a separate path and only
+        advertises single-token decode support.
         """
         # For UniformTypeKVCacheSpecs, check all contained specs
         kv_specs = (
@@ -742,8 +753,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         if has_trtllm_support:
             return AttentionCGSupport.UNIFORM_BATCH
-        else:
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+        if vllm_config.parallel_config.decode_context_parallel_size <= 1:
+            return AttentionCGSupport.UNIFORM_BATCH
+
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
@@ -883,6 +897,90 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    def _compute_flashinfer_expanded_decode_kv_metadata(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        block_table_tensor: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        page_size: int,
+    ) -> torch.Tensor:
+        """
+        Build token-level paged KV metadata for native FlashInfer decode.
+
+        FlashInfer's native decode wrapper treats each metadata row as a
+        non-causal single-query decode. Spec decode verifies multiple tokens per
+        request, so expand each request into one metadata row per query token and
+        shrink the visible KV length for earlier draft positions. This preserves
+        causal verification semantics while keeping the FlashInfer decode path
+        graph-compatible.
+        """
+        assert num_decodes > 0
+        assert num_decode_tokens % num_decodes == 0
+        rows_per_decode = num_decode_tokens // num_decodes
+
+        query_start_loc_np = query_start_loc_cpu.numpy()
+        query_lens_np = (
+            query_start_loc_np[1 : num_decodes + 1]
+            - query_start_loc_np[:num_decodes]
+        )
+        seq_lens_np = seq_lens_cpu.numpy()
+
+        indptr_np = self.paged_kv_indptr.np
+        last_page_len_np = self.paged_kv_last_page_len.np
+        indptr_np[0] = 0
+
+        total_blocks = 0
+        row_idx = 0
+        for req_idx in range(num_decodes):
+            query_len = int(query_lens_np[req_idx])
+            final_seq_len = int(seq_lens_np[req_idx])
+            for token_idx in range(rows_per_decode):
+                if token_idx < query_len:
+                    seq_len = final_seq_len - (query_len - 1 - token_idx)
+                    seq_len = max(seq_len, 0)
+                else:
+                    seq_len = 0
+
+                num_blocks = cdiv(seq_len, page_size) if seq_len > 0 else 0
+                total_blocks += num_blocks
+                indptr_np[row_idx + 1] = total_blocks
+                last_page_len_np[row_idx] = (
+                    page_size
+                    if seq_len > 0 and seq_len % page_size == 0
+                    else seq_len % page_size
+                )
+                row_idx += 1
+
+        assert row_idx == num_decode_tokens
+        assert total_blocks <= self.paged_kv_indices.gpu.numel()
+
+        self.paged_kv_indptr_cpu_buffer[: num_decode_tokens + 1] = (
+            self.paged_kv_indptr.cpu[: num_decode_tokens + 1]
+        )
+        paged_kv_indptr = self.paged_kv_indptr.gpu[: num_decode_tokens + 1]
+        paged_kv_indptr.copy_(
+            self.paged_kv_indptr_cpu_buffer[: num_decode_tokens + 1],
+            non_blocking=True,
+        )
+        self.paged_kv_last_page_len.gpu[:num_decode_tokens].copy_(
+            self.paged_kv_last_page_len.cpu[:num_decode_tokens],
+            non_blocking=True,
+        )
+
+        paged_kv_indices = self.paged_kv_indices.gpu[:total_blocks]
+        if total_blocks > 0:
+            _copy_expanded_page_indices_kernel[(num_decode_tokens,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                ROWS_PER_REQ=rows_per_decode,
+                BLOCK_SIZE=1024,
+            )
+        return paged_kv_indices
+
     def build(
         self,
         common_prefix_len: int,
@@ -898,6 +996,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 require_uniform=True,
             )
         )
+        if (
+            self.use_native_spec_decode
+            and self.reorder_batch_threshold > 1
+            and num_decodes > 0
+            and num_prefills > 0
+            and num_decode_tokens != num_decodes
+        ):
+            # Native FlashInfer spec-as-decode expands decode requests to
+            # token-level rows. Keep mixed multi-token decode/prefill batches on
+            # the causal prefill path for now because prefill metadata still
+            # uses request-level rows in the shared buffers below.
+            num_decodes = 0
+            num_prefills = num_reqs
+            num_decode_tokens = 0
+            num_prefill_tokens = num_actual_tokens
 
         page_size = self.page_size
         max_seq_len = common_attn_metadata.max_seq_len
@@ -927,6 +1040,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         decode_use_trtllm = (
             self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+        )
+        native_decode_expands_queries = (
+            num_decodes > 0
+            and num_prefills == 0
+            and not decode_use_trtllm
+            and self.use_native_spec_decode
+            and self.reorder_batch_threshold > 1
         )
 
         all_uses_trtllm = (num_prefills == 0 or prefill_use_trtllm) and (
@@ -1020,7 +1140,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Compute paged_kv_indices if necessary
         # paged_kv_indices is only needed for FlashInfer native paths;
         # TRTLLM paths use block_tables directly on GPU.
-        needs_paged_kv_indices = use_cascade or not all_uses_trtllm
+        needs_paged_kv_indices = use_cascade or (
+            not all_uses_trtllm and not native_decode_expands_queries
+        )
         if needs_paged_kv_indices:
             assert num_blocks_np is not None
             assert seq_lens_np is not None
@@ -1209,6 +1331,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
                 )
                 num_input_tokens = num_decode_tokens
+                if native_decode_expands_queries:
+                    paged_kv_indices = (
+                        self._compute_flashinfer_expanded_decode_kv_metadata(
+                            seq_lens_cpu,
+                            qo_indptr_cpu,
+                            block_table_tensor,
+                            num_decodes,
+                            num_decode_tokens,
+                            page_size,
+                        )
+                    )
+                assert paged_kv_indices is not None
 
                 decode_wrapper = self._get_decode_wrapper(
                     num_input_tokens, use_cudagraph
@@ -1960,6 +2094,32 @@ def _copy_page_indices_kernel(
     row_ptr = block_table + req_idx * block_table_stride
     start_idx = tl.load(cu_num_blocks + req_idx)
     end_idx = tl.load(cu_num_blocks + req_idx + 1)
+    num_blocks = end_idx - start_idx
+
+    offset = tl.arange(0, BLOCK_SIZE)
+    for i in tl.range(0, num_blocks, BLOCK_SIZE):
+        block_ids = tl.load(row_ptr + i + offset, mask=i + offset < num_blocks)
+        tl.store(
+            page_indices + start_idx + i + offset,
+            block_ids,
+            mask=i + offset < num_blocks,
+        )
+
+
+@triton.jit
+def _copy_expanded_page_indices_kernel(
+    page_indices,
+    block_table,
+    block_table_stride,
+    cu_num_blocks,
+    ROWS_PER_REQ: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    req_idx = row_idx // ROWS_PER_REQ
+    row_ptr = block_table + req_idx * block_table_stride
+    start_idx = tl.load(cu_num_blocks + row_idx)
+    end_idx = tl.load(cu_num_blocks + row_idx + 1)
     num_blocks = end_idx - start_idx
 
     offset = tl.arange(0, BLOCK_SIZE)
